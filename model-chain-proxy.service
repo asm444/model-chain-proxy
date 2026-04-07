@@ -1,0 +1,15 @@
+[Unit]
+Description=Model Chain Proxy - OpenRouter fallback chain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/model-chain-proxy/server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
