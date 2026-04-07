@@ -11,6 +11,42 @@ Client  →  localhost:8367  →  try model 1
                               all exhausted?   → 503 error
 ```
 
+### Request flow
+
+1. **Buffer** — the proxy reads the full client request body.
+2. **Parse** — checks if `stream: true` in the JSON body.
+3. **Fallback loop** — iterates through `models.list` (or `MODELS` env var), trying each model sequentially:
+   - **Non-streaming**: full response is buffered. On `5xx`, `429`, or network error, the loop continues to the next model. `4xx` responses (auth errors, bad requests) are forwarded to the client immediately.
+   - **Streaming**: the first model that accepts the connection gets its SSE stream piped directly to the client. No retry once piping starts — a broken SSE cannot be reconstructed mid-stream.
+4. **All failed** → `503` with a detailed error listing every model attempted and the reason for failure.
+
+### API key resolution
+
+The proxy checks, in order, for an API key:
+
+1. Client `Authorization: Bearer ...` header (respected, never overridden)
+2. `FALLBACK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` env vars
+3. Login shell sourcing (`bash -lc`) — picks up `export` from `.zshrc` / `.bashrc`
+
+The result is cached on first resolution so every request has zero overhead on auth lookup.
+
+### Model configuration
+
+By default, the proxy reads the fallback chain from `models.list` — one model per line, `#` for comments. Edited at any time and reloaded on next restart:
+
+```
+qwen/qwen3.6-plus:free
+nvidia/nemotron-3-super-120b-a12b:free
+# fallback
+minimax/minimax-m2.5:free
+```
+
+To override the file temporarily for a single run, set `MODELS`:
+
+```bash
+MODELS="qwen/qwen3.6-plus:free,google/gemini-2.0-flash:free" node server.js
+```
+
 ## Configuration
 
 All settings are optional — the proxy has sensible defaults.
@@ -21,36 +57,19 @@ All settings are optional — the proxy has sensible defaults.
 |---|---|---|
 | `PORT` | `8367` | Local listen port |
 | `UPSTREAM_BASE_URL` | `https://openrouter.ai/api/v1` | API endpoint to forward to |
-| `MODELS` | `qwen/qwen3.6-plus:free,nvidia/nemotron-3-super-120b-a12b:free,minimax/minimax-m2.5:free` | Comma-separated fallback chain |
+| `MODELS` | _(see models.list)_ | Comma-separated fallback chain (overrides file, optional) |
 | `FALLBACK_API_KEY` | — | OpenRouter API key (checked first) |
 | `OPENAI_API_KEY` | — | OpenRouter API key (checked second) |
 | `ANTHROPIC_API_KEY` | — | OpenRouter API key (checked third) |
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (checked fourth) |
 
-### API key resolution
+### API key setup
 
-The proxy looks for an API key in this order:
-
-1. Client `Authorization: Bearer ...` header (if present, no override)
-2. `FALLBACK_API_KEY` environment variable
-3. Shell session variables (sourced from your `.zshrc` / `.bashrc`)
-4. `OPENAI_API_KEY` environment variable
-5. `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` environment variables
-
-To have the proxy automatically pick up your key, add it to your shell config:
+To have the proxy pick up your key automatically from your shell config:
 
 ```bash
 # ~/.zshrc
 export OPENROUTER_API_KEY="your-api-key-here"
-```
-
-The proxy will source this from a login shell if the variable isn't already in its inherited environment.
-
-### Models
-
-Define your fallback chain:
-
-```bash
-export MODELS="qwen/qwen3.6-plus:free,google/gemini-2.0-flash:free,meta-llama/llama-3-3-70b-instruct:free"
 ```
 
 ## Usage
@@ -68,7 +87,7 @@ systemctl daemon-reload
 systemctl enable --now model-chain-proxy
 ```
 
-## Using with OpenClaude
+### Using with OpenClaude
 
 Point your `OPENAI_BASE_URL` to the proxy:
 
@@ -78,9 +97,9 @@ export OPENAI_BASE_URL=http://127.0.0.1:8367
 
 ## Monitoring
 
-### `/health`
+### `/health` and `/ready`
 
-Returns service status:
+Returns service status (both paths are equivalent):
 
 ```bash
 curl http://127.0.0.1:8367/health
@@ -95,26 +114,16 @@ Prometheus-style plain text metrics:
 curl http://127.0.0.1:8367/metrics
 ```
 
-Exposed metrics:
-
 | Metric | What it tells you |
 |---|---|
-| `proxy_model_attempts_total` | How often each model was tried |
-| `proxy_model_failures_total` | How often each model failed |
-| `proxy_model_served_total` | How many requests each model actually fulfilled |
-| `proxy_model_avg_ms` | Average latency per model (when it succeeded) |
 | `proxy_requests_total` | Total client requests received |
 | `proxy_errors_total` | Total 503 responses (entire chain failed) |
-
-Use these to decide: if a model has high `attempts` but low `served`, it's dead weight. If latency is high, consider reordering the chain.
-
-## Fallback behavior
-
-- Non-streaming requests: tries each model synchronously on `5xx`, `429`, or connection error — `4xx` responses (auth, bad request) are returned as-is.
-- Streaming requests: attempts the first available model. On stream error, the chain is not retried to avoid broken SSE to the client.
-- If every model fails: returns `503` with a list of which models failed and why.
+| `proxy_model_attempts_total{model="X"}` | How often model X was tried |
+| `proxy_model_failures_total{model="X"}` | How often model X failed |
+| `proxy_model_served_total{model="X"}` | How many requests model X fulfilled |
+| `proxy_model_avg_ms{model="X"}` | Average latency of model X |
 
 ## Requirements
 
 - Node.js 18+
-- No npm dependencies
+- Zero npm dependencies
