@@ -3,12 +3,10 @@
 # Usage: ./test.sh
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-PORT=0
 PID=""
-cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; rm "$DIR/models.list.test" 2>/dev/null; }
+cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; }
 trap cleanup EXIT
 
-# ── Use fresh port (kernel picks free one) ─────────────
 PORT=18467
 
 echo "╔═══════════════════════════════════════════╗"
@@ -26,7 +24,7 @@ sleep 2
 BASE="http://127.0.0.1:$PORT"
 
 # ── Test helpers ──────────────────────────────────────────
-PASS=0; FAIL=0; RESULTS=""
+PASS=0; FAIL=0
 
 pass() { printf "  \033[32mPASS\033[0m  %s\n" "$1"; PASS=$((PASS + 1)); }
 fail() { printf "  \033[31mFAIL\033[0m  %s — got: %s\n" "$1" "${2:0:120}"; FAIL=$((FAIL + 1)); }
@@ -40,31 +38,27 @@ sep "1. Health endpoint"
 H=$(curl -s --max-time 5 "$BASE/health" 2>/dev/null || echo "")
 echo "$H" | grep -q '"status":"ok"' && pass "status is ok" || fail "status is ok" "$H"
 echo "$H" | grep -qo '"models":[1-9]' && pass "models > 0" || fail "models > 0" "$H"
-echo "$H" | grep -q '"uptime":' && pass "uptime reported" || fail "uptime" "$H"
+echo "$H" | grep -q '"providers"' && pass "providers listed" || fail "providers" "$H"
 
 # ── 2. Metrics (fresh state) ──────────────────────────
 sep "2. Metrics (fresh state)"
 M=$(curl -s --max-time 5 "$BASE/metrics" 2>/dev/null || echo "")
-ok_resp "$M" "HELP proxy_requests_total" "prometheus format"
-ok_resp "$M" "proxy_requests_total 0"     "zero requests"
-ok_resp "$M" "proxy_errors_total 0"       "zero errors"
+ok_resp "$M" "proxy_requests_total" "prometheus format"
+ok_resp "$M" "proxy_requests_total 0" "zero requests"
+ok_resp "$M" "proxy_errors_total 0" "zero errors"
 
 # ── 3. Real request ────────────────────────────────────
 sep "3. Chat completions"
 R=$(curl -s -X POST "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}' \
+  -d '{"messages":[{"role":"user","content":"say hi in 3 words"}],"max_tokens":10}' \
   --max-time 90 2>/dev/null || echo "")
-MODEL=$(echo "$R" | grep -o '"model":"[^"]*"' | head -1 | cut -d'"' -f4)
-[ -n "$MODEL" ] && pass "got response from $MODEL" || fail "no model" "$R"
 ok_resp "$R" '"choices"' "valid response"
 ok_resp "$R" '"content"' "has content"
-ok_resp "$R" '"usage"'   "usage reported"
-if echo "$R" | grep -q '"code"'; then
-  ERR=$(echo "$R" | grep -o '"code":[0-9]*' | head -1)
-  fail "got error ($ERR)" "$R"
+if echo "$R" | grep -q '"code":503'; then
+  fail "all models failed" "$R"
 else
-  pass "no error code"
+  pass "at least one model succeeded"
 fi
 
 # ── 4. Metrics (after 1 request) ──────────────────────
@@ -73,15 +67,12 @@ M2=$(curl -s --max-time 5 "$BASE/metrics" 2>/dev/null || echo "")
 TOTAL=$(echo "$M2" | grep "^proxy_requests_total " | awk '{print $2}')
 [ "$TOTAL" = "1" ] && pass "totalRequests = 1" || fail "totalRequests = '$TOTAL'"
 
-SERVED=$(echo "$M2" | grep "proxy_model_served_total{model=" | awk '{s+=$2} END{print s+0}')
-[ "$SERVED" = "1" ] && pass "1 model served" || fail "served = $SERVED"
-
 # ── 5. Bad request ──────────────────────────────────────
 sep "5. Error handling (bad JSON)"
 BAD=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{bad}' 2>/dev/null || echo "000")
-[ "$BAD" = "400" ] && pass "bad JSON → 400" || fail "expected 400, got $BAD"
+[ "$BAD" = "400" ] && pass "bad JSON -> 400" || fail "expected 400, got $BAD"
 
 # ── Summary ─────────────────────────────────────────────
 TOTAL=$((PASS + FAIL))

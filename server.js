@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 
 const http = require("http");
-const https = require("https");
-const fs = require("fs");
-const path = require("path");
-const { execFileSync } = require("child_process");
+const { loadModelList, resolveApiKey, KEY_MAP } = require("./lib/config");
+const { httpRequest } = require("./lib/http");
 
 const PORT = process.env.PORT || 8367;
-const UPSTREAM = new URL(process.env.UPSTREAM_BASE_URL || "https://openrouter.ai/api/v1");
-const UPSTREAM_AGENT = new https.Agent({ keepAlive: true });
-const MODELS = process.env.MODELS
-  ? process.env.MODELS.split(",").map((s) => s.trim()).filter(Boolean)
-  : loadModels(path.join(__dirname, "models.list"));
+const MODELS = loadModelList();
 
-const AUTH_SOURCES = ["FALLBACK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"];
+// ── Provider registry ──
+const PROVIDERS = {};
+function getProvider(name) {
+  if (PROVIDERS[name]) return PROVIDERS[name];
+  if (!KEY_MAP.hasOwnProperty(name)) throw new Error(`Unknown provider: "${name}"`);
+  PROVIDERS[name] = require(`./providers/${name}`);
+  return PROVIDERS[name];
+}
 
 // ── Metrics (simple in-memory, zero dependencies) ──
 const startedAt = Date.now();
@@ -23,121 +24,21 @@ const metrics = {
   models: {},
 };
 
-function initMetrics() {
-  for (const m of MODELS) {
-    metrics.models[m] = { attempts: 0, failed: 0, served: 0, totalMs: 0 };
-  }
+for (const { provider, model } of MODELS) {
+  const key = `${provider}:${model}`;
+  metrics.models[key] = { attempts: 0, failed: 0, served: 0, totalMs: 0, avgMs: 0 };
 }
 
-function bumpAttempt(model) { metrics.models[model].attempts++; }
-function bumpFailed(model) { metrics.models[model].failed++; }
-function bumpServed(model, ms) {
-  metrics.models[model].served++;
-  metrics.models[model].totalMs += ms;
-  metrics.models[model].avgMs = Math.round(metrics.models[model].totalMs / metrics.models[model].served);
+function bumpAttempt(key) { metrics.models[key].attempts++; }
+function bumpFailed(key) { metrics.models[key].failed++; }
+function bumpServed(key, ms) {
+  const m = metrics.models[key];
+  m.served++;
+  m.totalMs += ms;
+  m.avgMs = Math.round(m.totalMs / m.served);
 }
 
-initMetrics();
-
-// ── Lazy-resolved API key ──
-let _resolvedKey = undefined;
-function resolveApiKey() {
-  if (_resolvedKey !== undefined) return _resolvedKey;
-
-  for (const key of AUTH_SOURCES) {
-    let val = process.env[key];
-    if (!val) {
-      try {
-        val = execFileSync("bash", ["-lc", `echo -n $${key}`], {
-          timeout: 3000,
-          env: { PATH: process.env.PATH, HOME: process.env.HOME, USER: process.env.USER },
-        }).toString();
-      } catch {
-        val = "";
-      }
-    }
-    if (val) { _resolvedKey = val; return val; }
-  }
-
-  _resolvedKey = null;
-  return null;
-}
-
-function loadModels(file) {
-  const models = fs.readFileSync(file, "utf8").trim()
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("#"));
-
-  if (models.length === 0) throw new Error("No models configured in models.list");
-  return models;
-}
-
-function buildHeaders(clientHeaders, bodyStr) {
-  const h = {
-    "content-type": "application/json",
-    "content-length": Buffer.byteLength(bodyStr),
-    host: UPSTREAM.hostname,
-  };
-
-  for (const k of ["authorization", "cookie", "user-agent", "http-referer"]) {
-    if (clientHeaders[k]) h[k] = clientHeaders[k];
-  }
-
-  if (!clientHeaders.authorization?.startsWith("Bearer ")) {
-    const token = resolveApiKey();
-    if (token) h.authorization = `Bearer ${token}`;
-  }
-
-  return h;
-}
-
-function request(model, apiPath, method, headers, body, stream) {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({ ...body, model, stream });
-
-    const req = https.request({
-      hostname: UPSTREAM.hostname,
-      port: UPSTREAM.port || 443,
-      path: UPSTREAM.pathname + apiPath,
-      method,
-      headers: buildHeaders(headers, payload),
-      agent: UPSTREAM_AGENT,
-      timeout: stream ? 90000 : 60000,
-    }, (res) => {
-      if (stream && res.statusCode >= 400) {
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => {
-          const msg = chunks.length ? chunks.join("") : `upstream returned ${res.statusCode}`;
-          reject(new Error(`model error ${res.statusCode}: ${String(msg).slice(0, 200)}`));
-        });
-        return;
-      }
-      if (stream) {
-        resolve(res);
-        return;
-      }
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
-    });
-
-    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-    req.on("error", reject);
-    req.end(payload);
-  });
-}
-
-function bufferBody(stream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on("data", (c) => chunks.push(c));
-    stream.on("error", reject);
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-  });
-}
-
+// ── Metrics formatting ──
 function formatMetrics() {
   const lines = [
     "# HELP proxy_requests_total Total client requests received",
@@ -153,21 +54,10 @@ function formatMetrics() {
     const safe = name.replace(/[{}"=]/g, "_");
     lines.push(
       "",
-      `# HELP proxy_model_attempts_total How many times a model was tried (including fallbacks)`,
-      `# TYPE proxy_model_attempts_total counter`,
       `proxy_model_attempts_total{model="${safe}"} ${d.attempts}`,
-      "",
-      `# HELP proxy_model_failures_total How many times a model failed`,
-      `# TYPE proxy_model_failures_total counter`,
       `proxy_model_failures_total{model="${safe}"} ${d.failed}`,
-      "",
-      `# HELP proxy_model_served_total How many requests this model successfully served`,
-      `# TYPE proxy_model_served_total counter`,
       `proxy_model_served_total{model="${safe}"} ${d.served}`,
-      "",
-      `# HELP proxy_model_avg_ms Average response time in milliseconds when served`,
-      `# TYPE proxy_model_avg_ms gauge`,
-      `proxy_model_avg_ms{model="${safe}"} ${d.avgMs ?? 0}`,
+      `proxy_model_avg_ms{model="${safe}"} ${d.avgMs}`,
     );
   }
 
@@ -175,20 +65,43 @@ function formatMetrics() {
   return lines.join("\n");
 }
 
+// ── Body buffering ──
+function bufferBody(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (c) => chunks.push(c));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+// ── Forward headers from client (for OpenAI-compat providers that accept them) ──
+function pickClientHeaders(clientHeaders) {
+  const h = {};
+  for (const k of ["user-agent", "http-referer"]) {
+    if (clientHeaders[k]) h[k] = clientHeaders[k];
+  }
+  return h;
+}
+
+// ── HTTP server ──
 const server = http.createServer(async (req, res) => {
   const reqUrl = new URL(req.url, `http://127.0.0.1:${PORT}`);
 
+  // Health check
   if (req.method === "GET" && (reqUrl.pathname === "/health" || reqUrl.pathname === "/ready")) {
+    const providers = [...new Set(MODELS.map((m) => m.provider))];
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
       uptime: process.uptime(),
       models: MODELS.length,
-      upstream: UPSTREAM.origin,
+      providers,
     }));
     return;
   }
 
+  // Metrics
   if (req.method === "GET" && reqUrl.pathname === "/metrics") {
     res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
     res.end(formatMetrics());
@@ -197,53 +110,56 @@ const server = http.createServer(async (req, res) => {
 
   metrics.totalRequests++;
 
-  let apiPath = reqUrl.pathname;
-  if (apiPath.startsWith("/v1")) apiPath = apiPath.slice(3);
-
   try {
     const raw = await bufferBody(req);
     const body = raw.length > 0 ? JSON.parse(raw.toString()) : {};
     const isStream = body.stream === true;
     const failures = [];
 
-    for (const model of MODELS) {
+    // Remove model from body — each provider sets its own
+    delete body.model;
+
+    for (const { provider: providerName, model } of MODELS) {
+      const metricsKey = `${providerName}:${model}`;
       const t0 = Date.now();
-      bumpAttempt(model);
+      bumpAttempt(metricsKey);
 
       try {
+        const provider = getProvider(providerName);
+        const apiKey = resolveApiKey(providerName);
+        const { url, headers, body: bodyStr } = provider.buildRequest(body, model, apiKey);
+
+        // Merge useful client headers
+        const clientH = pickClientHeaders(req.headers);
+        const mergedHeaders = { ...headers, ...clientH };
+
         if (isStream) {
-          const upstreamRes = await request(model, apiPath, req.method, req.headers, body, true);
+          const upstreamRes = await httpRequest(url, mergedHeaders, bodyStr, { stream: true });
           const ms = Date.now() - t0;
-          bumpServed(model, ms);
-          res.writeHead(upstreamRes.statusCode, {
-            "content-type": upstreamRes.headers["content-type"] || "text/event-stream",
-            "cache-control": "no-cache",
-            connection: "keep-alive",
-          });
-          upstreamRes.on("aborted", () => { if (!res.writableEnded) res.end(); });
-          upstreamRes.on("error", () => { if (!res.writableEnded) res.end(); });
-          upstreamRes.pipe(res);
+          bumpServed(metricsKey, ms);
+          provider.transformStream(upstreamRes, res);
           return;
         }
 
-        const { status, headers, body: respBody } = await request(
-          model, apiPath, req.method, req.headers, body, false
+        const { status, headers: respHeaders, body: respBody } = await httpRequest(
+          url, mergedHeaders, bodyStr, { stream: false }
         );
         const ms = Date.now() - t0;
 
         if (status >= 500 || status === 429) {
-          bumpFailed(model);
-          failures.push(`${model} (${status})`);
+          bumpFailed(metricsKey);
+          failures.push(`${metricsKey} (${status})`);
           continue;
         }
 
-        bumpServed(model, ms);
-        res.writeHead(status, { "content-type": headers["content-type"] || "application/json" });
-        res.end(respBody);
+        bumpServed(metricsKey, ms);
+        const adapted = provider.parseResponse(respBody);
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(adapted));
         return;
       } catch (err) {
-        bumpFailed(model);
-        failures.push(`${model} (${err.message})`);
+        bumpFailed(metricsKey);
+        failures.push(`${metricsKey} (${err.message})`);
       }
     }
 
@@ -258,8 +174,7 @@ const server = http.createServer(async (req, res) => {
       }));
     }
   } catch (err) {
-    // Only JSON parse errors are client errors (400); everything else is 500
-    const code = err instanceof SyntaxError || (err.message?.includes("Unexpected token")) ? 400 : 500;
+    const code = err instanceof SyntaxError || err.message?.includes("Unexpected token") ? 400 : 500;
     if (!res.headersSent) {
       res.writeHead(code, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: err.message, code } }));
@@ -275,7 +190,9 @@ server.on("error", (e) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
+  const providers = [...new Set(MODELS.map((m) => m.provider))];
+  const chain = MODELS.map((m) => `${m.provider}:${m.model}`).join(" \u2192 ");
   console.log(`model-chain-proxy listening on http://127.0.0.1:${PORT}`);
-  console.log(`  upstream : ${UPSTREAM.origin}`);
-  console.log(`  models   : ${MODELS.join(" \u2192 ")}`);
+  console.log(`  providers: ${providers.join(", ")}`);
+  console.log(`  chain    : ${chain}`);
 });

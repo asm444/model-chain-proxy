@@ -1,3 +1,6 @@
-qwen/qwen3.6-plus:free
-nvidia/nemotron-3-super-120b-a12b:free
-minimax/minimax-m2.5:free
+# Provider chain — tried in order, first success wins
+# Format: provider:model
+
+openrouter:qwen/qwen3-235b-a22b:free
+openrouter:google/gemini-2.5-flash-preview-05-20
+openrouter:deepseek/deepseek-chat-v3-0324:free
