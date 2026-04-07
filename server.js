@@ -9,7 +9,9 @@ const { execFileSync } = require("child_process");
 const PORT = process.env.PORT || 8367;
 const UPSTREAM = new URL(process.env.UPSTREAM_BASE_URL || "https://openrouter.ai/api/v1");
 const UPSTREAM_AGENT = new https.Agent({ keepAlive: true });
-const MODELS = loadModels(path.join(__dirname, "models.list"));
+const MODELS = process.env.MODELS
+  ? process.env.MODELS.split(",").map((s) => s.trim()).filter(Boolean)
+  : loadModels(path.join(__dirname, "models.list"));
 
 const AUTH_SOURCES = ["FALLBACK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"];
 
@@ -256,11 +258,19 @@ const server = http.createServer(async (req, res) => {
       }));
     }
   } catch (err) {
-    const code = err.message?.includes("JSON") ? 400 : 500;
+    // Only JSON parse errors are client errors (400); everything else is 500
+    const code = err instanceof SyntaxError || (err.message?.includes("Unexpected token")) ? 400 : 500;
     if (!res.headersSent) {
       res.writeHead(code, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: err.message, code } }));
     }
+  }
+});
+
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(`port ${PORT} is already in use`);
+    process.exit(1);
   }
 });
 
