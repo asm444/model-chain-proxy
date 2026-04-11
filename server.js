@@ -112,7 +112,16 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const raw = await bufferBody(req);
-    const body = raw.length > 0 ? JSON.parse(raw.toString()) : {};
+    let body = {};
+    if (raw.length > 0) {
+      try {
+        body = JSON.parse(raw.toString("utf8"));
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "Invalid JSON body", code: 400 } }));
+        return;
+      }
+    }
     const isStream = body.stream === true;
     const failures = [];
 
