@@ -66,12 +66,30 @@ function formatMetrics() {
 }
 
 // ── Body buffering ──
+const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
+
 function bufferBody(stream) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    stream.on("data", (c) => chunks.push(c));
-    stream.on("error", reject);
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    let totalBytes = 0;
+    let settled = false;
+
+    stream.on("data", (chunk) => {
+      if (settled) return;
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_BODY_BYTES) {
+        settled = true;
+        stream.resume(); // drain without storing; keeps socket open to send 413
+        const err = new Error("Payload too large");
+        err.statusCode = 413;
+        reject(err);
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    stream.on("error", (err) => { if (!settled) { settled = true; reject(err); } });
+    stream.on("end",   ()    => { if (!settled) { settled = true; resolve(Buffer.concat(chunks)); } });
   });
 }
 
@@ -183,7 +201,7 @@ const server = http.createServer(async (req, res) => {
       }));
     }
   } catch (err) {
-    const code = err instanceof SyntaxError || err.message?.includes("Unexpected token") ? 400 : 500;
+    const code = err.statusCode || 500;
     if (!res.headersSent) {
       res.writeHead(code, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: err.message, code } }));
