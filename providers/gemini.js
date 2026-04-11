@@ -67,9 +67,12 @@ module.exports = {
       if (!candidate) return null;
 
       const text = candidate.content?.parts?.map((p) => p.text).filter(Boolean).join("");
-      if (candidate.finishReason && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED") {
-        return { done: true };
-      }
+      const isDone = candidate.finishReason && candidate.finishReason !== "FINISH_REASON_UNSPECIFIED";
+
+      // Check text before isDone: the final Gemini event often carries both.
+      // Returning {text, done} lets adaptSseStream emit the content chunk
+      // before writing [DONE], so no text is ever lost.
+      if (isDone) return { text: text || undefined, done: true };
       if (text) return { text };
       return null;
     });
