@@ -162,9 +162,14 @@ const server = http.createServer(async (req, res) => {
 
         if (isStream) {
           const upstreamRes = await httpRequest(url, mergedHeaders, bodyStr, { stream: true });
-          const ms = Date.now() - t0;
-          bumpServed(metricsKey, ms);
-          provider.transformStream(upstreamRes, res);
+          // Headers are committed inside transformStream — cannot retry after this point.
+          try {
+            await provider.transformStream(upstreamRes, res);
+            bumpServed(metricsKey, Date.now() - t0);
+          } catch (streamErr) {
+            bumpFailed(metricsKey);
+            console.error(`[stream error] ${metricsKey}: ${streamErr.message}`);
+          }
           return;
         }
 

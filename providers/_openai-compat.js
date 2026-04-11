@@ -22,15 +22,19 @@ function makeOpenAICompat({ baseUrl, authHeader }) {
     },
 
     transformStream(upstreamRes, clientRes) {
-      // already OpenAI SSE — pipe directly
-      clientRes.writeHead(upstreamRes.statusCode, {
-        "content-type": upstreamRes.headers["content-type"] || "text/event-stream",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
+      // already OpenAI SSE — pipe directly, wrapped in a Promise so callers
+      // can detect stream errors and update metrics correctly.
+      return new Promise((resolve, reject) => {
+        clientRes.writeHead(upstreamRes.statusCode, {
+          "content-type": upstreamRes.headers["content-type"] || "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        upstreamRes.on("aborted", () => { if (!clientRes.writableEnded) clientRes.end(); reject(new Error("upstream aborted")); });
+        upstreamRes.on("error", (err) => { if (!clientRes.writableEnded) clientRes.end(); reject(err); });
+        upstreamRes.on("end", resolve);
+        upstreamRes.pipe(clientRes);
       });
-      upstreamRes.on("aborted", () => { if (!clientRes.writableEnded) clientRes.end(); });
-      upstreamRes.on("error", () => { if (!clientRes.writableEnded) clientRes.end(); });
-      upstreamRes.pipe(clientRes);
     },
   };
 }

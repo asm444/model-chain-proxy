@@ -58,7 +58,7 @@ module.exports = {
 
   transformStream(upstreamRes, clientRes) {
     let messageId = "chatcmpl-anthropic";
-    adaptSseStream(upstreamRes, clientRes, (event) => {
+    return adaptSseStream(upstreamRes, clientRes, (event) => {
       if (event.type === "message_start" && event.message?.id) {
         messageId = event.message.id;
         return null;
