@@ -141,7 +141,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        const { status, headers: respHeaders, body: respBody } = await httpRequest(
+        const { status, body: respBody } = await httpRequest(
           url, mergedHeaders, bodyStr, { stream: false }
         );
         const ms = Date.now() - t0;
